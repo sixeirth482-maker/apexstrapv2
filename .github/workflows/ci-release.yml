@@ -1,0 +1,174 @@
+name: CI (Release)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or tag to build
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Make Gradle executable
+        run: chmod +x ./gradlew
+
+      - name: Find Android SDK
+        shell: bash
+        run: |
+          set -e
+
+          if [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME" ]; then
+            SDK_ROOT="$ANDROID_HOME"
+          elif [ -n "${ANDROID_SDK_ROOT:-}" ] && [ -d "$ANDROID_SDK_ROOT" ]; then
+            SDK_ROOT="$ANDROID_SDK_ROOT"
+          else
+            echo "Android SDK was not found."
+            exit 1
+          fi
+
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          APKSIGNER="$(find "$SDK_ROOT/build-tools" \
+            -type f \
+            -name apksigner \
+            -print 2>/dev/null | sort -V | tail -n 1)"
+
+          if [ -z "$APKSIGNER" ]; then
+            echo "apksigner was not found in Android SDK build-tools."
+            exit 1
+          fi
+
+          echo "APKSIGNER=$APKSIGNER" >> "$GITHUB_ENV"
+
+          echo "Using apksigner:"
+          "$APKSIGNER" --version
+
+      - name: Build Release APK
+        run: |
+          ./gradlew :app:assembleRelease --stacktrace
+
+      - name: Prepare signing key
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          set -e
+
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "SIGNING_KEY secret is not configured."
+            exit 1
+          fi
+
+          KEYSTORE="$RUNNER_TEMP/key-chevstrap.jks"
+
+          printf '%s' "$SIGNING_KEY" | base64 --decode > "$KEYSTORE"
+
+          if [ ! -s "$KEYSTORE" ]; then
+            echo "Failed to create keystore."
+            exit 1
+          fi
+
+          echo "KEYSTORE=$KEYSTORE" >> "$GITHUB_ENV"
+
+      - name: Sign Release APK
+        shell: bash
+        env:
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -e
+
+          if [ -z "$ALIAS" ]; then
+            echo "ALIAS secret is not configured."
+            exit 1
+          fi
+
+          if [ -z "$KEY_STORE_PASSWORD" ]; then
+            echo "KEY_STORE_PASSWORD secret is not configured."
+            exit 1
+          fi
+
+          if [ -z "$KEY_PASSWORD" ]; then
+            echo "KEY_PASSWORD secret is not configured."
+            exit 1
+          fi
+
+          shopt -s nullglob
+
+          APK_FILES=(
+            app/build/outputs/apk/release/*.apk
+          )
+
+          if [ "${#APK_FILES[@]}" -eq 0 ]; then
+            echo "No release APK was found."
+            exit 1
+          fi
+
+          for APK in "${APK_FILES[@]}"; do
+            case "$APK" in
+              *-signed.apk)
+                continue
+                ;;
+            esac
+
+            APK_NAME="$(basename "$APK")"
+            APK_NAME="${APK_NAME%-unsigned.apk}"
+            APK_NAME="${APK_NAME%.apk}.apk"
+
+            SIGNED_APK="app/build/outputs/apk/release/$APK_NAME"
+
+            echo "Signing: $APK"
+            echo "Output: $SIGNED_APK"
+
+            "$APKSIGNER" sign \
+              --ks "$KEYSTORE" \
+              --ks-key-alias "$ALIAS" \
+              --ks-pass "pass:$KEY_STORE_PASSWORD" \
+              --key-pass "pass:$KEY_PASSWORD" \
+              --out "$SIGNED_APK" \
+              "$APK"
+
+            echo "Verifying: $SIGNED_APK"
+
+            "$APKSIGNER" verify \
+              --verbose \
+              "$SIGNED_APK"
+
+            rm "$APK"
+
+            echo "Created: $SIGNED_APK"
+          done
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: Chevstrap (Release)
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
